@@ -1,0 +1,16 @@
+discord.py>=2.7,<3  # DAVE E2EE (enforced 2026-03-02) needs 2.7+ just to connect to voice
+discord-ext-voice-recv  # NOTE: DAVE receive-decrypt still WIP -> inbound audio decode broken on normal VCs
+audioop-lts; python_version >= "3.13"
+faster-whisper
+coqui-tts
+torchcodec  # required by coqui-tts for audio IO on torch >= 2.9
+transformers>=4.43,<5  # coqui-tts XTTS imports isin_mps_friendly, removed in transformers 5.x
+webrtcvad-wheels
+praat-parselmouth  # runtime formant darkening (Praat "Change gender" / PSOLA — clean, no buzz)
+pyworld  # offline voiceprint diagnostics only (WORLD vocoder buzzes over Opus — not used at runtime)
+soxr
+numpy
+requests
+ddgs  # DuckDuckGo web search (weather/news)
+python-dotenv
+pytest

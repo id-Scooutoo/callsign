@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+sample.wav
+*.zip:Zone.Identifier
+pytest_cache/
+.pytest_cache/
+
+# Voice artifacts never get committed - see VOICE-CONSENT.md
+voiceprint/*
+!voiceprint/README.md

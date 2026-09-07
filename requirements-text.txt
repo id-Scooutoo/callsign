@@ -1,0 +1,7 @@
+# Minimal deps for the TEXT-ONLY deploy (VOICE_ENABLED=false).
+# No torch / coqui-tts / parselmouth — voice is off, so they're never imported.
+discord.py>=2.7,<3
+audioop-lts; python_version >= "3.13"
+python-dotenv
+requests
+ddgs  # DuckDuckGo web search (weather/news)
