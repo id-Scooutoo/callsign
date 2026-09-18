@@ -62,7 +62,15 @@ jobs:
   # ────────────────────────────────────────────────────────────────────────────────────────
   decide:
     # Cheap shape check before anything else: an `issue_comment` on a plain issue is not this
-    # driver's business (the executor handles those), and a fork's pull request never is.
+    # driver's business — the executor handles those.
+    #
+    # The fork check below is only half of one, and deliberately so: it costs nothing and keeps
+    # a fork's `pull_request` from claiming a runner at all. It cannot be the guard, because the
+    # OTHER two events cannot be checked here — a `pull_request_review` payload does carry
+    # `.pull_request.head.repo.full_name`, but an `issue_comment` payload carries no head repo
+    # at all, only `.issue.pull_request`'s urls. So the real refusal is in the gate, where a
+    # `gh pr view` is already being made and `isCrossRepository` answers for all three events at
+    # once. Found by the portier's own first review round on PR #1.
     if: >-
       (github.event_name != 'issue_comment' || github.event.issue.pull_request != null) &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
@@ -151,10 +159,20 @@ jobs:
           if [ -n "$pr" ] && [ "$step" != "none" ]; then
             # Everything below is read off the pull request itself rather than the payload,
             # because the payload of an `issue_comment` knows nothing about labels or branches.
-            view=$(gh pr view "$pr" -R "$REPO" --json labels,headRefName,state,isDraft)
+            view=$(gh pr view "$pr" -R "$REPO" --json labels,headRefName,state,isDraft,isCrossRepository)
             labels=$(printf '%s' "$view" | jq -r '.labels[].name')
             branch=$(printf '%s' "$view" | jq -r '.headRefName')
             prstate=$(printf '%s' "$view" | jq -r '.state')
+            fork=$(printf '%s' "$view" | jq -r '.isCrossRepository')
+
+            # The fork refusal, for every event rather than just `pull_request`. It matters more
+            # than it looks: `headRefName` on a cross-repository pull request is the BARE branch
+            # name inside the fork, so a fork branch named after one of ours would send the fix
+            # job's checkout at OUR branch of that name — and that job holds `contents: write`.
+            if [ "$fork" = "true" ]; then
+              echo "pull request #$pr comes from a fork — the portier does not run on it"
+              step=none
+            fi
 
             # Opt-in, and the only gate that is checked on every single event.
             if ! printf '%s\n' "$labels" | grep -qx "$PORTIER_LABEL"; then

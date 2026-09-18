@@ -76,13 +76,30 @@ pull request itself:
 - **It never merges and never approves.** APPROVE ENDS the loop; the merge is the owner's. The
   review job runs with `contents: read` and denies `gh pr review` / `gh pr merge` / `gh api` by
   name, so the verdict can only ever be a plain comment.
-- **Fork pull requests are refused.** They carry no secrets anyway. Do not add a
-  `pull_request_target` trigger to "fix" that — on a public repository it hands a fork's code
-  the repository's own token and secrets.
+- **Fork pull requests are refused**, on every event, in the gate (`isCrossRepository`) — not
+  in the job's `if:`, which can only see it on a `pull_request`. That distinction is the whole
+  point: `headRefName` on a cross-repository pull request is the bare branch name inside the
+  fork, so a fork branch named after one of ours would aim the fix job's checkout at OUR branch
+  of that name, with `contents: write` in hand. Do not add a `pull_request_target` trigger to
+  "make fork PRs work" either — on a public repository it hands a fork's code the repository's
+  own token and secrets.
 - **Hosted runners only.** `ubuntu-latest`, never a self-hosted runner. MojRedmineGitlab runs
   its executor on a self-hosted VPS runner; that repo is private and the runner is its own box.
   A self-hosted runner attached to a public repository is reachable from any fork's pull
   request, and this repo shares no box with anything.
+
+## Why the executor does not check for forks, when the driver does
+
+Raised as a nit by the first review round, and worth an answer in writing rather than a shrug.
+The two are not the same risk. The driver decides by itself and then spends `contents: write` on
+a branch it picked from `headRefName`; the executor runs only where somebody with write access
+just wrote `@claude`, in that thread, and `anthropics/claude-code-action@v1` resolves the pull
+request's branch itself rather than being handed a name. A trusted person invoking it on a fork
+PR is asking for exactly what they get.
+
+That is a reason, not a proof: what the action does with a fork branch is inside the action, not
+visible in this repository. If the executor is ever given a `prompt:` (agent mode) and a branch
+of our choosing, this paragraph stops applying and it needs the gate's check too.
 
 ## Why the driver does not post an `@claude` comment
 

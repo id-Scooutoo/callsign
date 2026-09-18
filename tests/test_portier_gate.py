@@ -78,14 +78,15 @@ def gate(workflow):
     return next(s for s in steps if s.get("id") == "gate")["run"]
 
 
-def pr_view(labels, branch="feat/x", state="OPEN", draft=False):
-    """What `gh pr view --json labels,headRefName,state,isDraft` would print."""
+def pr_view(labels, branch="feat/x", state="OPEN", draft=False, fork=False):
+    """What `gh pr view --json labels,headRefName,state,isDraft,isCrossRepository` prints."""
     return json.dumps(
         {
             "labels": [{"name": n} for n in labels],
             "headRefName": branch,
             "state": state,
             "isDraft": draft,
+            "isCrossRepository": fork,
         }
     )
 
@@ -242,6 +243,25 @@ CASES = [
         pr_view(["portier"], state="MERGED"),
         {"step": "none"},
         id="a-closed-pr-ends-it",
+    ),
+    pytest.param(
+        # The hole the portier's own first review round found on PR #1. The job-level `if:`
+        # refuses a fork's `pull_request`, but an `issue_comment` payload carries no head repo
+        # to check, so a verdict comment on a handed-over fork PR used to reach `fix` — which
+        # holds `contents: write` and would check out `headRefName`, a BARE branch name that
+        # resolves inside THIS repo.
+        "issue_comment",
+        comment("PORTIER VERDICT: REQUEST CHANGES"),
+        pr_view(["portier"], branch="ci/portier", fork=True),
+        {"step": "none"},
+        id="a-fork-pr-is-refused-on-a-comment-too",
+    ),
+    pytest.param(
+        "pull_request_review",
+        review("changes_requested"),
+        pr_view(["portier"], fork=True),
+        {"step": "none"},
+        id="a-fork-pr-is-refused-on-a-formal-review-too",
     ),
     pytest.param(
         # A human's push DOES produce `synchronize`; the fix session's own push does not,
