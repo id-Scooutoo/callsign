@@ -26,8 +26,10 @@
 #   * A hard round cap, asked at both moments a round would be spent.
 #   * It never merges and never casts a formal GitHub review. APPROVE ENDS the loop and leaves
 #     the merge to the owner.
-#   * Fork pull requests are refused outright. They carry no secrets anyway, and this file must
-#     never grow a `pull_request_target` trigger to "fix" that.
+#   * Fork pull requests are refused, in two layers because one cannot cover all three events:
+#     the job's `if:` catches a fork's own `pull_request` before a runner is claimed, and the
+#     gate's `isCrossRepository` catches the other two, whose payloads carry no head repo to
+#     check. This file must never grow a `pull_request_target` trigger to "fix" that.
 name: portier-driver
 
 on:
