@@ -11,3 +11,6 @@ pytest_cache/
 # Voice artifacts never get committed - see VOICE-CONSENT.md
 voiceprint/*
 !voiceprint/README.md
+
+# The real personality file. persona.example.md is the only shape that ships.
+persona.md
