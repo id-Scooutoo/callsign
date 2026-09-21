@@ -1,0 +1,40 @@
+# The test gate. Small on purpose: this repository's full dependency set is torch + coqui-tts
+# + faster-whisper, which is a GPU install and several gigabytes — nothing a hosted runner
+# should be asked to do on every push.
+#
+# So CI installs only what the pure-Python modules import and skips the two test files that
+# import the heavy ones at module level (`tests/test_stt.py`, `tests/test_tts.py`). Those two
+# stay a local, GPU-machine job. `pyproject.toml` already marks the individual GPU tests with
+# `@pytest.mark.gpu`, but a marker does not help when the import at the top of the file is
+# what fails, which is why this ignores the files rather than deselecting the marker.
+#
+# The portier's review and fix prompts (`.github/portier/`) run this exact command, so the
+# three lines below and the ones in those files have to stay in step.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install the light dependency set
+        run: |
+          python -m pip install -q -U pip wheel
+          python -m pip install -q numpy soxr python-dotenv requests pytest pyyaml
+          python -m pip install -q -e . --no-deps
+
+      - name: pytest
+        run: python -m pytest -q --ignore=tests/test_stt.py --ignore=tests/test_tts.py

@@ -1,0 +1,132 @@
+# The portier's executor. A comment that starts with `@claude` under a pull request or an
+# issue starts a Claude Code session on a GitHub-hosted runner, and the session answers in
+# that same thread.
+#
+#   comment "@claude …"  ──▶  guard (phrase · who · not a bot)  ──▶  session on ubuntu-latest
+#                                      │                                     │
+#                              not all three: skipped,            open PR → commits on
+#                              no runner, no tokens               the PR's own branch
+#
+# This is the muscle, driven by a human. The loop that moves by itself — review, fix,
+# review again, stop — is `portier-driver.yml`, which does not go through this file at all:
+# it calls the action directly, because a comment written with the workflow token arrives as
+# a Bot and the `not a bot` guard below would, rightly, throw it away.
+#
+# Required repository secret:
+#   CLAUDE_CODE_OAUTH_TOKEN   the owner's subscription token (`claude setup-token`)
+#
+# This repository is PUBLIC, which decides two things here:
+#   * `ubuntu-latest`, never a self-hosted runner. A self-hosted runner on a public repo is
+#     reachable from any fork's pull request and shares the box with whatever else runs on it.
+#   * `issue_comment` is the only trigger. It runs against the default branch with the
+#     repository's own secrets, so the code that runs is always `main`'s, never a fork's.
+#     Do not add `pull_request_target` to this file for any reason.
+name: portier-executor
+
+on:
+  issue_comment:
+    types: [created]
+
+# One session per thread. Keyed on the issue/PR number, NOT on `github.ref`: an
+# `issue_comment` event runs against the default branch, so every PR in the repository would
+# otherwise share one group.
+#
+# `cancel-in-progress: false` — queue the second invocation instead of killing the first. A
+# session cancelled mid-flight can leave the PR branch with a half-finished commit and the
+# thread with no answer, which is worse than waiting.
+concurrency:
+  group: portier-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  session:
+    # Three conditions, all cheap, all *before* a runner is claimed — which is the point: a
+    # comment that fails any of them costs nothing at all, not even a checkout.
+    #
+    #   not a bot   the action posts its own progress comment and that comment quotes the
+    #               phrase, so without this the executor answers itself, in a loop, on our
+    #               tokens.
+    #   the phrase  `startsWith`, NOT `contains`, and that is the whole point: with
+    #               `contains` every comment that so much as *names* the feature is an
+    #               invocation — a backticked `@claude` in a review, a `> `-quoted reply,
+    #               this runbook's own prose pasted into a thread. An invocation is the first
+    #               thing in the comment; a mention of it anywhere else is not.
+    #
+    #               Do not "fix" the mismatch with the action's own `trigger_phrase` below:
+    #               that one is a substring match with no anchored variant, so this guard is
+    #               the ONLY layer where the mention/invocation line can be drawn.
+    #   who         the owner plus anyone with write access. An allowlist, so a value GitHub
+    #               adds later is denied by default rather than allowed by accident. On a
+    #               public repository this is the whole door: anybody may comment here.
+    if: >-
+      github.event.comment.user.type != 'Bot' &&
+      startsWith(github.event.comment.body, '@claude') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    # A model session can stop making progress without failing. Also the outer bound on one
+    # invocation's cost. Raise it only with a run that actually hit it.
+    timeout-minutes: 30
+    # Exactly what answering in the thread and committing to the PR branch needs, and nothing
+    # else. Notably absent: `actions` (the session cannot read other runs' logs) and `id-token`.
+    permissions:
+      contents: write # commit to the pull request's branch
+      issues: write # a PR comment IS an issue comment
+      pull-requests: write # the thread's review comments
+    steps:
+      # Shallow: the action fetches the pull request's branch to a depth it computes from the
+      # PR's commit count, so a deep clone here would only cost time.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          # The subscription token, straight from repository secrets into the action's input —
+          # never into a `run:` block, where one `set -x` puts it in the log.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          trigger_phrase: "@claude"
+          # Pinned rather than left empty. Empty means the action mints an installation token
+          # from a GitHub App, whose permissions are whatever that App was granted; the
+          # workflow token is capped by the `permissions:` block above and by one repository
+          # setting.
+          #
+          # Be exact about that setting, because it is what the choice rests on: this token is
+          # NOT structurally unable to approve. With `pull-requests: write` it can submit an
+          # approving review whenever *Settings → Actions → General → "Allow GitHub Actions to
+          # create and approve pull requests"* is enabled. It is off (GitHub's default) and
+          # must stay off — docs/PORTIER.md names it in the setup block so it has an owner in
+          # writing rather than being an unwatched checkbox.
+          #
+          # The price: a push made with the workflow token does not trigger workflows, so
+          # ci.yml does not re-run by itself on the session's commits. Re-run it with
+          # `gh run rerun`, or push anything by hand.
+          github_token: ${{ github.token }}
+          # A turn cap on top of the wall-clock one. Two rails, because they fail differently:
+          # `timeout-minutes` catches a session that hangs, this catches one that keeps busily
+          # going nowhere.
+          claude_args: --max-turns 60
+          # Third line, not the boundary. First line: with no `prompt:` input this action runs
+          # in TAG MODE, which builds its own `--allowedTools` — Read/Grep/Glob, the github MCP
+          # comment tools, and a few git verbs. No general `Bash`. So every entry below is
+          # redundant today; it stays because redundant is not wrong and modes change.
+          #
+          # Second line: branch protection on `main` — nothing merges without the owner's
+          # approving review.
+          #
+          # What the list does is raise the cost of an accident by denying the spellings a
+          # session actually reaches for. `gh api` is on it because without it the first two
+          # are theatre — merge and review are one `gh api -X PUT` away — and `curl` for the
+          # same reason one step further out. It stops there and is honest about stopping:
+          # `python`, `git` and `bash -c …` reach the same endpoints with the same token and
+          # cannot be denied by prefix. Reading the PR (`gh pr view --json …`) is untouched.
+          settings: |
+            {
+              "permissions": {
+                "deny": [
+                  "Bash(gh pr merge:*)",
+                  "Bash(gh pr review:*)",
+                  "Bash(gh api:*)",
+                  "Bash(curl:*)"
+                ]
+              }
+            }

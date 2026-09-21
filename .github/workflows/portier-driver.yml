@@ -1,0 +1,386 @@
+# The portier's driver — the duty officer that decides which session to spend next.
+#
+#   label `portier` on a PR ─▶ review ─▶ verdict ─┬─ APPROVE         ─▶ stop, call the owner
+#                                  ▲              └─ REQUEST CHANGES ─▶ fix ─┐
+#                                  └───────────────────────────────────────┘
+#                                            (capped at MAX_ROUNDS reviews)
+#
+# In MyOwnGitlabRedmine this driver is a Django module reading GitHub webhooks
+# (`backend/github/portier.py`). This repository has no backend, so the same decision runs
+# here, on GitHub's own events, with two substitutions:
+#
+#   Django                          here
+#   ──────                          ────
+#   Project.portier_enabled    →    the `portier` label on the pull request (opt-in, per PR)
+#   PortierRun.rounds_used     →    the `portier-round-<n>` label on the same pull request
+#   PortierRun.waiting_for     →    the event that started this run; a signal that is not the
+#                                   one the state expects simply resolves to `none`
+#
+# One thing does NOT carry over and is the reason `fix` chains straight into `review` inside a
+# single run instead of waiting for an event: a push made with the workflow token starts no
+# further workflow run, so the fix session's own commits never produce a `synchronize`. The
+# Django driver could wait for it because a GitHub App receives that delivery regardless.
+#
+# Rails, same as the original's:
+#   * Default off. No label, nothing happens — and the label is per pull request, never global.
+#   * A hard round cap, asked at both moments a round would be spent.
+#   * It never merges and never casts a formal GitHub review. APPROVE ENDS the loop and leaves
+#     the merge to the owner.
+#   * Fork pull requests are refused, in two layers because one cannot cover all three events:
+#     the job's `if:` catches a fork's own `pull_request` before a runner is claimed, and the
+#     gate's `isCrossRepository` catches the other two, whose payloads carry no head repo to
+#     check. This file must never grow a `pull_request_target` trigger to "fix" that.
+name: portier-driver
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, synchronize, labeled]
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
+
+# One run per pull request, queued rather than cancelled: a session killed mid-flight can
+# leave the branch with a half-finished commit and the thread with no answer.
+concurrency:
+  group: portier-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  # The opt-in label. Adding it to a pull request is what hands THAT pull request over.
+  PORTIER_LABEL: portier
+  # Five reviews and four fix passes is more patience than a human reviewer usually has, and
+  # still a bounded bill. 0 is a legitimate value and stops the portier before the first review.
+  MAX_ROUNDS: 5
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────────────────
+  # The decision. No session, no tokens spent — just which step, if any, this event earns.
+  # ────────────────────────────────────────────────────────────────────────────────────────
+  decide:
+    # Cheap shape check before anything else: an `issue_comment` on a plain issue is not this
+    # driver's business — the executor handles those.
+    #
+    # The fork check below is only half of one, and deliberately so: it costs nothing and keeps
+    # a fork's `pull_request` from claiming a runner at all. It cannot be the guard, because the
+    # OTHER two events cannot be checked here — a `pull_request_review` payload does carry
+    # `.pull_request.head.repo.full_name`, but an `issue_comment` payload carries no head repo
+    # at all, only `.issue.pull_request`'s urls. So the real refusal is in the gate, where a
+    # `gh pr view` is already being made and `isCrossRepository` answers for all three events at
+    # once. Found by the portier's own first review round on PR #1.
+    if: >-
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request != null) &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    outputs:
+      step: ${{ steps.gate.outputs.step }}
+      pr: ${{ steps.gate.outputs.pr }}
+      branch: ${{ steps.gate.outputs.branch }}
+      round: ${{ steps.gate.outputs.round }}
+    steps:
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ev="$GITHUB_EVENT_NAME"
+          p="$GITHUB_EVENT_PATH"
+          step=none
+          pr=""
+
+          # Who this driver listens to. The review session comments with the workflow token,
+          # so it arrives as `github-actions[bot]` — that identity has to be admitted here or
+          # the loop's own verdict would be thrown away. Everyone else needs write access.
+          trusted() {
+            case "$1" in
+              OWNER|MEMBER|COLLABORATOR) return 0 ;;
+            esac
+            [ "$2" = "github-actions[bot]" ]
+          }
+
+          case "$ev" in
+            pull_request)
+              pr=$(jq -r '.pull_request.number' "$p")
+              action=$(jq -r '.action' "$p")
+              draft=$(jq -r '.pull_request.draft' "$p")
+              # `labeled` is how a pull request is handed over after it was opened, which is
+              # the usual order. Any other label added to it is not an invocation.
+              if [ "$action" = "labeled" ]; then
+                added=$(jq -r '.label.name' "$p")
+                [ "$added" = "$PORTIER_LABEL" ] || { echo "label '$added' is not the handover"; added=""; }
+                [ -n "$added" ] && [ "$draft" = "false" ] && step=review
+              elif [ "$draft" = "false" ]; then
+                # opened · ready_for_review · synchronize — in every case there is new code
+                # and no verdict on it. A push by the fix session does NOT reach here (the
+                # workflow token starts no run); this is a human's push.
+                step=review
+              fi
+              ;;
+
+            pull_request_review)
+              pr=$(jq -r '.pull_request.number' "$p")
+              state=$(jq -r '.review.state' "$p")
+              assoc=$(jq -r '.review.author_association' "$p")
+              login=$(jq -r '.review.user.login' "$p")
+              if trusted "$assoc" "$login"; then
+                case "$state" in
+                  approved) step=stop-approved ;;
+                  changes_requested) step=fix ;;
+                esac
+              fi
+              ;;
+
+            issue_comment)
+              pr=$(jq -r '.issue.number' "$p")
+              body=$(jq -r '.comment.body' "$p")
+              assoc=$(jq -r '.comment.author_association' "$p")
+              login=$(jq -r '.comment.user.login' "$p")
+              # The ONE line this driver reads out of a comment, anchored at the start of a
+              # line on purpose: quoting the runbook, or naming the verdict mid-sentence, is
+              # not a verdict. `.github/portier/review.md` is what puts it there.
+              if trusted "$assoc" "$login"; then
+                verdict=$(printf '%s\n' "$body" \
+                  | tr -d '\r' \
+                  | grep -m1 -E '^PORTIER VERDICT: (APPROVE|REQUEST CHANGES)[[:space:]]*$' || true)
+                case "$verdict" in
+                  *"APPROVE"*) step=stop-approved ;;
+                  *"REQUEST CHANGES"*) step=fix ;;
+                esac
+              fi
+              ;;
+          esac
+
+          round=0
+          branch=""
+          if [ -n "$pr" ] && [ "$step" != "none" ]; then
+            # Everything below is read off the pull request itself rather than the payload,
+            # because the payload of an `issue_comment` knows nothing about labels or branches.
+            view=$(gh pr view "$pr" -R "$REPO" --json labels,headRefName,state,isDraft,isCrossRepository)
+            labels=$(printf '%s' "$view" | jq -r '.labels[].name')
+            branch=$(printf '%s' "$view" | jq -r '.headRefName')
+            prstate=$(printf '%s' "$view" | jq -r '.state')
+            fork=$(printf '%s' "$view" | jq -r '.isCrossRepository')
+
+            # The fork refusal, for every event rather than just `pull_request`. It matters more
+            # than it looks: `headRefName` on a cross-repository pull request is the BARE branch
+            # name inside the fork, so a fork branch named after one of ours would send the fix
+            # job's checkout at OUR branch of that name — and that job holds `contents: write`.
+            if [ "$fork" = "true" ]; then
+              echo "pull request #$pr comes from a fork — the portier does not run on it"
+              step=none
+            fi
+
+            # Opt-in, and the only gate that is checked on every single event.
+            if ! printf '%s\n' "$labels" | grep -qx "$PORTIER_LABEL"; then
+              echo "pull request #$pr is not handed over (no '$PORTIER_LABEL' label)"
+              step=none
+            fi
+            # A closed pull request ends the run: the verdict or push it waits for can never
+            # come, and a loop that keeps answering on it would be talking to nobody.
+            if [ "$prstate" != "OPEN" ]; then
+              echo "pull request #$pr is $prstate"
+              step=none
+            fi
+
+            round=$(printf '%s\n' "$labels" | sed -n 's/^portier-round-\([0-9]\{1,\}\)$/\1/p' | head -1)
+            round=${round:-0}
+
+            # The cap, asked at BOTH moments a round would be spent. Asking only before the
+            # review would let the last fix run a session nobody can ever review; asking only
+            # before the fix would let a cap of 0 buy one review anyway.
+            if [ "$step" = "review" ] || [ "$step" = "fix" ]; then
+              if [ "$round" -ge "$MAX_ROUNDS" ]; then
+                step=stop-round-limit
+              fi
+            fi
+          fi
+
+          echo "event=$ev pr=$pr step=$step round=$round branch=$branch"
+          {
+            echo "step=$step"
+            echo "pr=$pr"
+            echo "branch=$branch"
+            echo "round=$round"
+          } >> "$GITHUB_OUTPUT"
+
+  # ────────────────────────────────────────────────────────────────────────────────────────
+  # Apply the review. Commits onto the pull request's own branch — never a new branch and
+  # never a second pull request.
+  # ────────────────────────────────────────────────────────────────────────────────────────
+  fix:
+    needs: decide
+    if: needs.decide.outputs.step == 'fix'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Explicit: an `issue_comment` or `pull_request_review` event runs against the
+          # default branch, so without this the session would fix `main`'s copy of the file.
+          ref: ${{ needs.decide.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Identify the committer
+        run: |
+          git config user.name "portier"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - id: prompt
+        env:
+          PR: ${{ needs.decide.outputs.pr }}
+          BRANCH: ${{ needs.decide.outputs.branch }}
+        run: |
+          set -euo pipefail
+          body=$(sed -e "s|{pr}|$PR|g" -e "s|{branch}|$BRANCH|g" .github/portier/fix.md)
+          {
+            echo "text<<PORTIER_PROMPT_EOF"
+            printf '%s\n' "$body"
+            echo "PORTIER_PROMPT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          # A `prompt:` makes this AGENT mode, which — unlike the executor's tag mode — does
+          # not build its own tool allowlist. The session has to run the tests and push, so
+          # Bash is granted and the dangerous verbs are denied by name below.
+          claude_args: --max-turns 60 --allowedTools "Read,Grep,Glob,Edit,Write,Bash"
+          settings: |
+            {
+              "permissions": {
+                "deny": [
+                  "Bash(gh pr merge:*)",
+                  "Bash(gh pr review:*)",
+                  "Bash(gh pr close:*)",
+                  "Bash(gh api:*)",
+                  "Bash(git push --force:*)",
+                  "Bash(git push -f:*)"
+                ]
+              }
+            }
+
+  # ────────────────────────────────────────────────────────────────────────────────────────
+  # Review the pull request and write the verdict. Runs either on its own (new code arrived)
+  # or straight after a fix, because that fix's push produces no event of its own.
+  # ────────────────────────────────────────────────────────────────────────────────────────
+  review:
+    needs: [decide, fix]
+    if: >-
+      always() &&
+      needs.decide.result == 'success' &&
+      (
+        needs.decide.outputs.step == 'review' ||
+        (needs.decide.outputs.step == 'fix' && needs.fix.result == 'success')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.decide.outputs.branch }}
+          fetch-depth: 0
+
+      # One round is one code review asked for. A fix pass costs none of its own: it is the
+      # review that follows it the cap has to bound, and that review is counted here — the one
+      # place a round is ever spent.
+      - name: Spend a round
+        env:
+          PR: ${{ needs.decide.outputs.pr }}
+          ROUND: ${{ needs.decide.outputs.round }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          next=$((ROUND + 1))
+          gh pr edit "$PR" -R "$REPO" --remove-label "portier-round-$ROUND" 2>/dev/null || true
+          gh label create "portier-round-$next" -R "$REPO" --color ededed \
+            --description "portier: code review rounds spent" 2>/dev/null || true
+          gh pr edit "$PR" -R "$REPO" --add-label "portier-round-$next"
+          echo "round $ROUND -> $next (cap $MAX_ROUNDS)"
+
+      - id: prompt
+        env:
+          PR: ${{ needs.decide.outputs.pr }}
+          BRANCH: ${{ needs.decide.outputs.branch }}
+        run: |
+          set -euo pipefail
+          body=$(sed -e "s|{pr}|$PR|g" -e "s|{branch}|$BRANCH|g" .github/portier/review.md)
+          {
+            echo "text<<PORTIER_PROMPT_EOF"
+            printf '%s\n' "$body"
+            echo "PORTIER_PROMPT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          claude_args: --max-turns 60 --allowedTools "Read,Grep,Glob,Bash"
+          # A reviewer writes nothing but a comment. `contents: read` above already stops a
+          # push; these deny the two spellings that would turn the comment into a formal,
+          # binding GitHub review, which only the owner casts.
+          settings: |
+            {
+              "permissions": {
+                "deny": [
+                  "Bash(gh pr merge:*)",
+                  "Bash(gh pr review:*)",
+                  "Bash(gh pr close:*)",
+                  "Bash(gh api:*)",
+                  "Bash(git push:*)",
+                  "Bash(git commit:*)"
+                ]
+              }
+            }
+
+  # ────────────────────────────────────────────────────────────────────────────────────────
+  # The loop ended. Say why on the pull request and take the label off, so nothing here starts
+  # again by itself — a stopped run waits for nothing.
+  # ────────────────────────────────────────────────────────────────────────────────────────
+  stop:
+    needs: decide
+    if: startsWith(needs.decide.outputs.step, 'stop-')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Report and stand down
+        env:
+          PR: ${{ needs.decide.outputs.pr }}
+          STEP: ${{ needs.decide.outputs.step }}
+          ROUND: ${{ needs.decide.outputs.round }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$STEP" = "stop-approved" ]; then
+            msg="🛎️ Portier: **APPROVE** after $ROUND round(s). The loop stops here — the merge is @${{ github.repository_owner }}'s."
+          else
+            msg="🛎️ Portier: stopped at the round cap ($ROUND/$MAX_ROUNDS). Nothing further is automatic — @${{ github.repository_owner }}, this one needs a person."
+          fi
+          # Deliberately carries no \`PORTIER VERDICT:\` line, so this comment cannot restart
+          # the loop it just ended.
+          gh pr comment "$PR" -R "$REPO" --body "$msg"
+          gh pr edit "$PR" -R "$REPO" --remove-label "$PORTIER_LABEL"
